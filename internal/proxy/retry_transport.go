@@ -5,11 +5,13 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +36,10 @@ type RetryTransport struct {
 	// baseSelector allows choosing a per-request transport (e.g. instance-specific TLS settings).
 	// When nil or returning nil, base is used.
 	baseSelector func(*http.Request) http.RoundTripper
+	// breakers tracks per-instance circuit breaker state and concurrency
+	// budgets. When nil, disabled, or the request carries no instance
+	// context, the plain per-request retry behavior is used.
+	breakers *breakerRegistry
 }
 
 // NewRetryTransport creates a new RetryTransport that wraps the given RoundTripper
@@ -49,6 +55,17 @@ func NewRetryTransportWithSelector(base http.RoundTripper, selector func(*http.R
 	return &RetryTransport{
 		base:         base,
 		baseSelector: selector,
+	}
+}
+
+// NewRetryTransportWithBreakers creates a RetryTransport with a per-request
+// selector and a registry of per-instance circuit breakers and request
+// budgets.
+func NewRetryTransportWithBreakers(base http.RoundTripper, selector func(*http.Request) http.RoundTripper, breakers *breakerRegistry) *RetryTransport {
+	return &RetryTransport{
+		base:         base,
+		baseSelector: selector,
+		breakers:     breakers,
 	}
 }
 
@@ -196,10 +213,54 @@ func canRetryForbidden(req *http.Request, proxyCtx *proxyContext, replay request
 	return replay.replayable && req.GetBody != nil
 }
 
-// RoundTrip implements http.RoundTripper with retry logic for transient errors
+// RoundTrip implements http.RoundTripper with per-instance circuit breaking,
+// request budgets, and retry logic for transient errors.
 //
 //nolint:wrapcheck // RoundTrip should not wrap errors - callers expect unwrapped transport errors
 func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	breaker := t.breakerFor(req)
+	if breaker == nil {
+		return t.roundTripWithRetries(req, nil)
+	}
+
+	probe, release, err := breaker.acquire(req.Context())
+	if err != nil {
+		if rejected, ok := errors.AsType[*breakerRejectedError](err); ok {
+			return rejectedResponse(req, rejected), nil
+		}
+		return nil, err
+	}
+
+	resp, err := t.roundTripWithRetries(req, breaker)
+
+	statusCode := 0
+	if resp != nil {
+		statusCode = resp.StatusCode
+	}
+	breaker.record(probe, statusCode, err)
+	release()
+
+	return resp, err
+}
+
+// breakerFor returns the breaker for the request's instance, or nil when
+// circuit breaking is unavailable for this request.
+func (t *RetryTransport) breakerFor(req *http.Request) *instanceBreaker {
+	if t.breakers == nil || !t.breakers.cfg.Enabled {
+		return nil
+	}
+	proxyCtx, ok := getProxyContext(req.Context())
+	if !ok || proxyCtx == nil || proxyCtx.instanceID == 0 {
+		return nil
+	}
+	return t.breakers.get(proxyCtx.instanceID)
+}
+
+// roundTripWithRetries runs the per-request retry loop. breaker is nil when
+// circuit breaking does not apply to this request.
+//
+//nolint:wrapcheck // RoundTrip should not wrap errors - callers expect unwrapped transport errors
+func (t *RetryTransport) roundTripWithRetries(req *http.Request, breaker *instanceBreaker) (*http.Response, error) {
 	var lastErr error
 
 	base := t.transportFor(req)
@@ -225,7 +286,10 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err == nil {
 			if resp != nil && resp.StatusCode == http.StatusForbidden && canRetryForbidden(req, proxyCtx, replay, authRetried) {
 				closeResponseBody(resp)
-				if err := proxyCtx.refreshSession(req.Context()); err != nil {
+				if err := refreshProxySession(req.Context(), proxyCtx, breaker); err != nil {
+					if errors.Is(err, errAuthLoginCooling) {
+						return syntheticResponse(req, http.StatusForbidden, forbiddenCooldownBody(), nil), nil
+					}
 					return nil, err
 				}
 				authRetried = true
@@ -256,6 +320,49 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	return nil, lastErr
+}
+
+// refreshProxySession refreshes the qBittorrent session, single-flighting and
+// rate-limiting the login through the instance breaker when one is available.
+func refreshProxySession(ctx context.Context, proxyCtx *proxyContext, breaker *instanceBreaker) error {
+	login := func(loginCtx context.Context) error {
+		return proxyCtx.refreshSession(loginCtx)
+	}
+	if breaker != nil {
+		return breaker.refreshSession(ctx, login)
+	}
+	return login(ctx)
+}
+
+// rejectedResponse builds the response served when a request is not admitted:
+// 502 with Retry-After for an open breaker, 503 when the budget is exhausted.
+func rejectedResponse(req *http.Request, rejected *breakerRejectedError) *http.Response {
+	if errors.Is(rejected, errBreakerOpen) {
+		retryAfter := retryAfterSeconds(rejected.retryAfter)
+		header := http.Header{}
+		header.Set("Content-Type", "application/json")
+		header.Set("Retry-After", strconv.Itoa(retryAfter))
+		return syntheticResponse(req, http.StatusBadGateway, breakerOpenResponseBody(retryAfter), header)
+	}
+
+	header := http.Header{}
+	header.Set("Content-Type", "application/json")
+	header.Set("Retry-After", "0")
+	return syntheticResponse(req, http.StatusServiceUnavailable, budgetExhaustedBody(), header)
+}
+
+func syntheticResponse(req *http.Request, statusCode int, body []byte, header http.Header) *http.Response {
+	return &http.Response{
+		Status:        http.StatusText(statusCode),
+		StatusCode:    statusCode,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}
 }
 
 // closeIdleConnections closes idle connections in the transport if supported
