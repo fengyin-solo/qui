@@ -123,6 +123,26 @@ Update qui to the latest release:
 ./qui update
 ```
 
+The update runs in stages so an interrupted download or verification failure can never leave a broken binary:
+
+1. The release archive and signed checksums download into a temporary directory, with progress output. Press `Ctrl+C` to cancel before any file is replaced.
+2. The checksums file is verified against the embedded ECDSA release certificate, and the archive is checksum-verified and unpacked in the temporary directory.
+3. A preflight check hashes the current and candidate binaries and confirms enough free disk space and write permissions.
+4. The current binary is copied to a persistent backup directory, then the candidate is swapped in atomically. After the swap, qui re-hashes the new file and runs `qui version` on it to confirm the expected release. Any failure restores the previous binary automatically.
+
+Options:
+
+```bash
+# Verify a release without replacing anything
+./qui update --dry-run
+
+# Keep backups in a custom directory (default: .qui-backups next to the binary)
+./qui update --backup-dir /var/backups/qui
+
+# Keep at most 5 previous binaries; older backups are removed
+./qui update --max-backups 5
+```
+
 This command replaces the qui binary in place. For Docker, pull a new image instead (see [Docker](../getting-started/docker.md#updating)).
 
 ## Migrate From Other Torrent Clients

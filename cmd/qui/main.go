@@ -386,19 +386,65 @@ If no --config-dir is specified, uses the OS-specific default location:
 }
 
 func RunUpdateCommand() *cobra.Command {
+	var (
+		backupDir  string
+		maxBackups int
+		dryRun     bool
+	)
+
 	var command = &cobra.Command{
 		Use:                   "update",
 		Short:                 "Update qui",
 		Long:                  `Update qui to the latest version.`,
 		DisableFlagsInUseLine: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
 			updater := update.NewUpdater(update.Config{
 				Repository: "autobrr/qui",
 				Version:    buildinfo.Version,
+				BackupDir:  backupDir,
+				MaxBackups: maxBackups,
+				DryRun:     dryRun,
 			})
-			return updater.Run(cmd.Context())
+
+			progressShown := false
+			result, err := updater.Run(ctx, func(p update.Progress) {
+				if p.TotalSize > 0 {
+					progressShown = true
+					fmt.Fprintf(cmd.ErrOrStderr(), "\rdownloading %s: %.1f/%.1f MiB",
+						p.Asset, float64(p.BytesRead)/(1024*1024), float64(p.TotalSize)/(1024*1024))
+				}
+			})
+			if progressShown {
+				fmt.Fprintln(cmd.ErrOrStderr())
+			}
+			if err != nil {
+				return err
+			}
+
+			switch {
+			case result.UpToDate:
+				cmd.Println("Current binary is the latest version:", buildinfo.Version)
+			case result.DryRun:
+				cmd.Printf("Dry run: %s -> %s\n", result.Report.CurrentVersion, result.Report.CandidateVersion)
+				cmd.Println("  target:  ", result.Report.TargetPath)
+				cmd.Println("  backup:  ", result.Report.BackupDir)
+				cmd.Println("  sha256:  ", result.Report.CandidateSHA256)
+				cmd.Println("No changes were made.")
+			case result.Updated:
+				cmd.Println("Successfully updated to version:", result.Report.CandidateVersion)
+				cmd.Println("Previous binary backed up in:", result.Report.BackupDir)
+			}
+			return nil
 		},
 	}
+
+	command.Flags().StringVar(&backupDir, "backup-dir", "",
+		"directory for persistent backups of the previous binary (defaults to .qui-backups next to the binary)")
+	command.Flags().IntVar(&maxBackups, "max-backups", 3, "number of previous binaries to keep in the backup directory")
+	command.Flags().BoolVar(&dryRun, "dry-run", false, "download and verify the candidate without replacing the binary")
 
 	command.SetUsageTemplate(`Usage:
   {{.CommandPath}}
