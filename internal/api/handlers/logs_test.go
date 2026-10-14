@@ -6,6 +6,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -190,6 +191,151 @@ func TestLogsHandler_StreamLogs_WritesToHub(t *testing.T) {
 	}
 	if !strings.Contains(body, "test line 2") {
 		t.Error("expected body to contain 'test line 2'")
+	}
+}
+
+// streamLogsOnce opens the SSE endpoint, lets it flush the initial response,
+// then cancels and returns the captured SSE body.
+func streamLogsOnce(t *testing.T, handler *LogsHandler, target, lastEventID string) string {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequest(http.MethodGet, target, http.NoBody).WithContext(ctx)
+	if lastEventID != "" {
+		req.Header.Set("Last-Event-ID", lastEventID)
+	}
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handler.StreamLogs(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not stop within timeout")
+	}
+
+	return rec.Body.String()
+}
+
+func TestLogsHandler_StreamLogs_EventsCarrySequenceID(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig)
+	handler.GetHub().Write("first line")
+
+	body := streamLogsOnce(t, handler, "/logs/stream?limit=10", "")
+
+	if !strings.Contains(body, "id: 1\n") {
+		t.Errorf("expected SSE id field, body: %q", body)
+	}
+	if !strings.Contains(body, "data: first line") {
+		t.Errorf("expected log line in data field, body: %q", body)
+	}
+}
+
+func TestLogsHandler_StreamLogs_ResumeReplaysOnlyMissed(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig)
+	hub := handler.GetHub()
+	for i := range 5 {
+		hub.Write(fmt.Sprintf("line-%d", i+1))
+	}
+
+	body := streamLogsOnce(t, handler, "/logs/stream?limit=10", "3")
+
+	if strings.Contains(body, "event: gap") {
+		t.Errorf("did not expect a gap event, body: %q", body)
+	}
+	if count := strings.Count(body, "data: "); count != 2 {
+		t.Errorf("expected exactly 2 replayed data frames, got %d: %q", count, body)
+	}
+	if !strings.Contains(body, "data: line-4") || !strings.Contains(body, "data: line-5") {
+		t.Errorf("expected lines 4 and 5, body: %q", body)
+	}
+	if strings.Contains(body, "data: line-1\n") || strings.Contains(body, "data: line-3\n") {
+		t.Errorf("already delivered lines must not be replayed, body: %q", body)
+	}
+}
+
+func TestLogsHandler_StreamLogs_InvalidLastEventIDFallsBackToSnapshot(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig)
+	hub := handler.GetHub()
+	for i := range 3 {
+		hub.Write(fmt.Sprintf("line-%d", i+1))
+	}
+
+	body := streamLogsOnce(t, handler, "/logs/stream?limit=10", "not-a-number")
+
+	if count := strings.Count(body, "data: "); count != 3 {
+		t.Errorf("invalid Last-Event-ID must send the full snapshot, got %d frames: %q", count, body)
+	}
+}
+
+func TestLogsHandler_StreamLogs_ResumeAfterEvictionEmitsGap(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig)
+	hub := handler.GetHub()
+	for i := range 1005 {
+		hub.Write(fmt.Sprintf("line-%04d", i+1))
+	}
+
+	// seq 1 is the client's last seen line; seqs 2..5 already evicted.
+	body := streamLogsOnce(t, handler, "/logs/stream?limit=1000", "1")
+
+	if !strings.Contains(body, "event: gap") {
+		t.Errorf("expected a gap event, body prefix: %q", body[:min(200, len(body))])
+	}
+	if !strings.Contains(body, `"from":2`) || !strings.Contains(body, `"to":5`) || !strings.Contains(body, `"dropped":4`) {
+		t.Errorf("gap payload should report seqs 2..5 and 4 dropped, body: %q", body)
+	}
+	if !strings.Contains(body, "data: line-1005") {
+		t.Errorf("expected newest buffered line, body: %q", body)
+	}
+	if strings.Contains(body, "data: line-0001") {
+		t.Errorf("evicted line must not be replayed, body: %q", body)
+	}
+}
+
+func TestLogsHandler_StreamLogs_LevelFilter(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig)
+	hub := handler.GetHub()
+	hub.Write(`{"level":"info","message":"info-msg-unique"}`)
+	hub.Write(`{"level":"error","message":"error-msg-unique"}`)
+
+	body := streamLogsOnce(t, handler, "/logs/stream?level=warn", "")
+
+	if strings.Contains(body, "info-msg-unique") {
+		t.Errorf("info line should be filtered out at level=warn, body: %q", body)
+	}
+	if !strings.Contains(body, "error-msg-unique") {
+		t.Errorf("error line should be delivered at level=warn, body: %q", body)
+	}
+}
+
+func TestLogsHandler_StreamLogs_InvalidLevelSendsAll(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig)
+	hub := handler.GetHub()
+	hub.Write(`{"level":"trace","message":"trace-msg-unique"}`)
+	hub.Write(`{"level":"error","message":"error-msg-unique"}`)
+
+	for _, level := range []string{"", "bogus"} {
+		target := "/logs/stream"
+		if level != "" {
+			target += "?level=" + level
+		}
+		body := streamLogsOnce(t, handler, target, "")
+		if !strings.Contains(body, "trace-msg-unique") || !strings.Contains(body, "error-msg-unique") {
+			t.Errorf("level=%q must preserve the send-all behavior, body: %q", level, body)
+		}
 	}
 }
 

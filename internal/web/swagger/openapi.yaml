@@ -5456,22 +5456,49 @@ paths:
       tags:
         - System
       summary: Stream live logs
-      description: Server-Sent Events endpoint for streaming live log lines. Sends initial history (configurable via limit parameter) then streams new log lines in real-time.
+      description: >-
+        Server-Sent Events endpoint for streaming live log lines. Every log
+        line carries a monotonic server-side sequence number as the SSE `id`
+        field. On connect the server sends an initial snapshot (configurable via
+        the limit parameter); when the client reconnects with a Last-Event-ID
+        header, only buffered lines with a higher sequence number are replayed,
+        without duplicates. If the requested sequence has already slid out of
+        the ring buffer, or a slow subscriber's buffer overflows, an explicit
+        `gap` event is emitted with the shape {"from":<uint64>,"to":<uint64>,
+        "dropped":<uint64>}, where dropped is the cumulative count of lines the
+        connection has missed. The optional level parameter filters the stream
+        server-side to lines at or above that level (trace, debug, info, warn,
+        error); a missing or invalid value sends all levels.
       parameters:
         - name: limit
           in: query
-          description: Number of historical log lines to send initially (default 1000)
+          description: Number of matching historical log lines in the initial snapshot (default 1000). Ignored when resuming with Last-Event-ID, which replays the full missed segment.
           schema:
             type: integer
             default: 1000
+        - name: level
+          in: query
+          description: Minimum log level to send (trace, debug, info, warn, error). Missing or invalid sends every level.
+          schema:
+            type: string
+            enum: [trace, debug, info, warn, error]
+        - name: Last-Event-ID
+          in: header
+          description: Last event id received on a previous connection. Set automatically by browsers on SSE reconnect; only buffered lines above it are replayed. A value older than the ring buffer produces a `gap` event.
+          schema:
+            type: integer
+            format: uint64
       responses:
         '200':
-          description: SSE stream of log lines
+          description: >-
+            SSE stream. Default message events carry a log line with its
+            sequence number as `id`; named `gap` events announce a missing
+            sequence range and the cumulative dropped count.
           content:
             text/event-stream:
               schema:
                 type: string
-                description: Each message is a log line in SSE format
+                description: 'Line event: "id: <seq>\ndata: <line>\n\n". Gap event: "id: <to>\nevent: gap\ndata: {\"from\":<uint64>,\"to\":<uint64>,\"dropped\":<uint64>}\n\n".'
 
   /api/logs/files:
     get:

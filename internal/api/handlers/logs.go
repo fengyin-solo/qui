@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"mime"
 	"net/http"
@@ -220,8 +221,19 @@ func (h *LogsHandler) UpdateLogSettings(w http.ResponseWriter, r *http.Request) 
 }
 
 // StreamLogs streams log lines via SSE.
+//
+// Each log event carries its ring-buffer sequence number as the SSE id, so a
+// reconnecting browser (which sends Last-Event-ID) is replayed only the missed
+// buffered segment. A requested sequence that has slid out of the buffer, or a
+// burst that overflowed a slow subscriber's channel, is announced with an
+// explicit "gap" event carrying the cumulative dropped count instead of
+// producing silent holes. The optional level parameter filters server-side to
+// lines at or above the given level; a missing or invalid value sends all
+// levels.
 func (h *LogsHandler) StreamLogs(w http.ResponseWriter, r *http.Request) {
 	limit := h.parseLimit(r)
+	minLevel := parseMinLevel(r.URL.Query().Get("level"))
+	afterSeq := parseLastEventID(r.Header.Get("Last-Event-ID"))
 
 	flusher, hub, err := h.prepareSSE(w)
 	if err != nil {
@@ -229,12 +241,24 @@ func (h *LogsHandler) StreamLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sub := hub.Subscribe(r.Context())
+	sub, snapshot := hub.SubscribeWith(r.Context(), logstream.SubscribeOptions{
+		MinLevel: minLevel,
+		AfterSeq: afterSeq,
+		Limit:    limit,
+	})
 	defer hub.Unsubscribe(sub)
 
-	if err := h.sendHistory(w, flusher, hub, limit); err != nil {
-		return
+	if snapshot.Gap != nil {
+		if err := writeSSEGap(w, *snapshot.Gap); err != nil {
+			return
+		}
 	}
+	for _, line := range snapshot.Lines {
+		if err := writeSSELine(w, line); err != nil {
+			return
+		}
+	}
+	flusher.Flush()
 
 	h.streamLoop(r.Context(), w, flusher, sub)
 }
@@ -247,6 +271,29 @@ func (h *LogsHandler) parseLimit(r *http.Request) int {
 		}
 	}
 	return limit
+}
+
+// parseMinLevel resolves the level query parameter. A missing or invalid value
+// yields LevelUnknown, preserving the unfiltered default behavior.
+func parseMinLevel(raw string) logstream.Level {
+	if strings.TrimSpace(raw) == "" {
+		return logstream.LevelUnknown
+	}
+	return logstream.ParseLevel(raw)
+}
+
+// parseLastEventID reads the SSE Last-Event-ID header. A missing or invalid
+// value yields zero, which the hub treats as a fresh connection.
+func parseLastEventID(header string) uint64 {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0
+	}
+	id, err := strconv.ParseUint(header, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
 }
 
 var (
@@ -273,20 +320,41 @@ func (h *LogsHandler) prepareSSE(w http.ResponseWriter) (http.Flusher, *logstrea
 	return flusher, hub, nil
 }
 
-func (h *LogsHandler) sendHistory(w http.ResponseWriter, flusher http.Flusher, hub *logstream.Hub, limit int) error {
-	history := hub.History(limit)
-	for _, line := range history {
-		if err := writeSSEData(w, line); err != nil {
-			return err
-		}
+// appendSSEData writes one or more data: fields. Embedded newlines need their
+// own field to keep the SSE frame intact.
+func appendSSEData(builder *strings.Builder, data string) {
+	for part := range strings.SplitSeq(data, "\n") {
+		builder.WriteString("data: ")
+		builder.WriteString(part)
+		builder.WriteByte('\n')
 	}
-	flusher.Flush()
-	return nil
 }
 
-func writeSSEData(w http.ResponseWriter, data string) error {
-	_, err := fmt.Fprintf(w, "data: %s\n\n", data) //nolint:gosec // G705: an SSE stream is text/event-stream, never rendered as HTML
-	return err                                     //nolint:wrapcheck // SSE write errors are terminal; wrapping adds no value
+// writeSSELine emits a log line as a default "message" event with the line's
+// sequence number as the SSE id.
+func writeSSELine(w http.ResponseWriter, line logstream.Line) error {
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "id: %d\n", line.Seq)
+	appendSSEData(&builder, line.Text)
+	builder.WriteByte('\n')
+	_, err := io.WriteString(w, builder.String()) //nolint:gosec // G705: text/event-stream is never rendered as HTML
+	return err                                    //nolint:wrapcheck // SSE write errors are terminal; wrapping adds no value
+}
+
+// writeSSEGap emits a named gap event. Its id is the last missed sequence, so a
+// further reconnect resumes after the gap instead of re-announcing it.
+func writeSSEGap(w http.ResponseWriter, gap logstream.Gap) error {
+	payload, err := json.Marshal(gap)
+	if err != nil {
+		return err
+	}
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "id: %d\n", gap.To)
+	builder.WriteString("event: gap\n")
+	appendSSEData(&builder, string(payload))
+	builder.WriteByte('\n')
+	_, err = io.WriteString(w, builder.String()) //nolint:gosec // G705: text/event-stream is never rendered as HTML
+	return err                                   //nolint:wrapcheck // SSE write errors are terminal; wrapping adds no value
 }
 
 func (h *LogsHandler) streamLoop(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, sub *logstream.Subscriber) {
@@ -297,11 +365,15 @@ func (h *LogsHandler) streamLoop(ctx context.Context, w http.ResponseWriter, flu
 		select {
 		case <-ctx.Done():
 			return
-		case line, ok := <-sub.Channel():
+		case event, ok := <-sub.Channel():
 			if !ok {
 				return
 			}
-			if err := writeSSEData(w, line); err != nil {
+			if event.Kind == logstream.EventGap {
+				if err := writeSSEGap(w, event.Gap); err != nil {
+					return
+				}
+			} else if err := writeSSELine(w, event.Line); err != nil {
 				return
 			}
 			flusher.Flush()

@@ -32,7 +32,7 @@ If an environment variable such as `QUI__LOG_LEVEL` sets a value, the matching f
 
 ## Live log viewer
 
-The viewer connects to the qui log stream over SSE. On connect, it loads the most recent 1,000 lines and then follows new output live. A green dot shows a healthy connection. If the connection drops, the viewer reconnects after 3 seconds.
+The viewer connects to the qui log stream over SSE. On connect, it loads the most recent 1,000 lines and then follows new output live. A green dot shows a healthy connection. If the connection drops, the viewer reconnects after 3 seconds and resumes from the last line it received, without repeating lines. If the missed lines have already aged out of the server's buffer, or this connection could not keep up with the stream, qui shows a warning that entries were lost.
 
 The toolbar gives you these controls:
 

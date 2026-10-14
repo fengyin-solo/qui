@@ -538,7 +538,10 @@ function LiveLogViewer({ configPath }: { configPath?: string }) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const eventSourceRef = useRef<EventSource | null>(null)
   const reconnectTimeoutRef = useRef<number | null>(null)
-  const nextIdRef = useRef(0)
+  // lastSeqRef tracks the server sequence id; replayed frames after a reconnect are skipped.
+  const lastSeqRef = useRef(0)
+  // Negative ids keep lines without a server id (older servers / demo) distinct from real seqs.
+  const localIdRef = useRef(0)
   const autoScrollRef = useRef(autoScroll)
 
   // Keep ref in sync for use in event handler
@@ -570,7 +573,19 @@ function LiveLogViewer({ configPath }: { configPath?: string }) {
     }
 
     es.onmessage = (event) => {
-      const newEntry: RawLogLine = { id: nextIdRef.current++, text: event.data as string }
+      const seq = Number.parseInt(event.lastEventId ?? "", 10)
+      const hasSeq = Number.isSafeInteger(seq) && seq > 0
+      // Reconnect replays buffered lines; drop any seq already displayed.
+      if (hasSeq && seq <= lastSeqRef.current) {
+        return
+      }
+      if (hasSeq) {
+        lastSeqRef.current = seq
+      }
+      const newEntry: RawLogLine = {
+        id: hasSeq ? seq : --localIdRef.current,
+        text: event.data as string,
+      }
       setLines((prev) => {
         const newLines = [...prev, newEntry]
         // Soft cap when auto-scroll ON (user following live)
@@ -585,6 +600,12 @@ function LiveLogViewer({ configPath }: { configPath?: string }) {
         return newLines
       })
     }
+
+    // A gap means lines were permanently missed (history evicted before resume,
+    // or this connection could not keep up). Surface the existing dropped warning.
+    es.addEventListener("gap", () => {
+      setDroppedWhilePaused(true)
+    })
 
     es.onerror = () => {
       setIsConnected(false)
