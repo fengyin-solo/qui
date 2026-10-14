@@ -15,7 +15,8 @@ import (
 )
 
 type TransmissionImport struct {
-	opts Options
+	opts   Options
+	commit commitFunc
 }
 
 func NewTransmissionImporter(opts Options) *TransmissionImport {
@@ -44,14 +45,14 @@ func (i *TransmissionImport) Migrate() error {
 		}
 	}
 
+	run, err := newMigrateRun(i.opts, i.commit)
+	if err != nil {
+		return err
+	}
+
 	matches, err := filepath.Glob(filepath.Join(torrentsDir, "*.torrent"))
 	if err != nil {
 		return errors.Wrapf(err, "glob error: %s", torrentsDir)
-	}
-
-	if len(matches) == 0 {
-		log.Info().Msgf("Found 0 files to process in: %s", torrentsDir)
-		return nil
 	}
 
 	totalJobs := len(matches)
@@ -59,9 +60,6 @@ func (i *TransmissionImport) Migrate() error {
 	log.Info().Msgf("Total torrents to process: %d", totalJobs)
 
 	positionNum := 0
-	imported := 0
-	failed := 0
-	skipped := 0
 	for _, match := range matches {
 		positionNum++
 
@@ -72,14 +70,31 @@ func (i *TransmissionImport) Migrate() error {
 		file, err := metainfo.LoadFromFile(match)
 		if err != nil {
 			log.Error().Err(err).Msgf("Could not load torrent file %s", match)
-			failed++
+			if recordErr := run.record("", baseName, ResultFailed, "could not load torrent file: "+err.Error()); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
 		metaInfo, err := file.UnmarshalInfo()
 		if err != nil {
 			log.Error().Err(err).Msgf("Could not unmarshal torrent file %s", match)
-			failed++
+			if recordErr := run.record("", baseName, ResultFailed, "could not unmarshal torrent metadata: "+err.Error()); recordErr != nil {
+				return recordErr
+			}
+			continue
+		}
+
+		name := metaInfo.BestName()
+
+		// qBittorrent requires BT_backup files named by infohash
+		torrentID := file.HashInfoBytes().HexString()
+		infoHash := file.HashInfoBytes().Bytes()
+
+		// a previous run already imported this infohash; never write it again
+		if run.alreadyImported(torrentID) {
+			log.Info().Msgf("(%d/%d) %s already imported in a previous run, skipping", positionNum, totalJobs, torrentID)
+			run.skippedThisRun++
 			continue
 		}
 
@@ -87,20 +102,10 @@ func (i *TransmissionImport) Migrate() error {
 		// v1 infohash naming is wrong for v2-only, and the block bitfield
 		// covers the padded v1 stream while UpvertedFiles is the v2 tree view
 		if metaInfo.MetaVersion == 2 {
-			log.Warn().Msgf("(%d/%d) %s is a BitTorrent v2 torrent, not supported by this importer, skipping", positionNum, totalJobs, metaInfo.BestName())
-			skipped++
-			continue
-		}
-
-		// qBittorrent requires BT_backup files named by infohash
-		torrentID := file.HashInfoBytes().HexString()
-
-		torrentOutFile := filepath.Join(i.opts.QbitDir, torrentID+".torrent")
-
-		// If file already exists, skip
-		if _, err = os.Stat(torrentOutFile); err == nil {
-			log.Info().Msgf("(%d/%d) %s Torrent already exists, skipping", positionNum, totalJobs, torrentID)
-			skipped++
+			log.Warn().Msgf("(%d/%d) %s is a BitTorrent v2 torrent, not supported by this importer, skipping", positionNum, totalJobs, name)
+			if recordErr := run.record(torrentID, name, ResultSkipped, "BitTorrent v2 torrent not supported"); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
@@ -110,7 +115,9 @@ func (i *TransmissionImport) Migrate() error {
 		resumeFile, err := i.decodeResumeFile(resumeFilePath)
 		if err != nil {
 			log.Error().Err(err).Msgf("Could not decode transmission resume file %s for %s", resumeFilePath, torrentID)
-			failed++
+			if recordErr := run.record(torrentID, name, ResultFailed, "could not decode transmission resume file: "+err.Error()); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
@@ -118,22 +125,28 @@ func (i *TransmissionImport) Migrate() error {
 		// downloaded; deselected files may legitimately be missing
 		pieces, complete := transmissionPieces(resumeFile, &metaInfo)
 		if !complete {
-			log.Warn().Msgf("(%d/%d) %s is not fully downloaded, skipping: %s", positionNum, totalJobs, metaInfo.Name, match)
-			skipped++
+			log.Warn().Msgf("(%d/%d) %s is not fully downloaded, skipping: %s", positionNum, totalJobs, name, match)
+			if recordErr := run.record(torrentID, name, ResultSkipped, "torrent is not fully downloaded"); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
 		// a corrupt entry with an unusable download dir would import a torrent
 		// qBittorrent resolves against its own default download dir
 		if !filepath.IsAbs(filepath.Clean(resumeFile.Destination)) {
-			log.Warn().Msgf("(%d/%d) %s has an unusable download dir %q, skipping", positionNum, totalJobs, metaInfo.Name, resumeFile.Destination)
-			skipped++
+			log.Warn().Msgf("(%d/%d) %s has an unusable download dir %q, skipping", positionNum, totalJobs, name, resumeFile.Destination)
+			if recordErr := run.record(torrentID, name, ResultSkipped, "download dir is not absolute: "+resumeFile.Destination); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
 		if i.opts.DryRun {
 			log.Info().Msgf("dry-run: (%d/%d) would import: %s", positionNum, totalJobs, torrentID)
-			imported++
+			if err := run.record(torrentID, name, ResultImported, ""); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -218,30 +231,29 @@ func (i *TransmissionImport) Migrate() error {
 		newFastResume.Pieces = pieces
 
 		// Set 20 byte SHA1 hash
-		newFastResume.InfoHash = file.HashInfoBytes().Bytes()
+		newFastResume.InfoHash = infoHash
 
-		// copy torrent file
-		fastResumeOutFile := filepath.Join(i.opts.QbitDir, torrentID+".fastresume")
-		if err = newFastResume.Encode(fastResumeOutFile); err != nil {
-			log.Error().Err(err).Msgf("Could not create qBittorrent fastresume file %s", fastResumeOutFile)
-			failed++
+		// fields verified after writing: piece length and the ordered file list
+		newFastResume.setFileMeta(&metaInfo)
+
+		if err = run.commit(&newFastResume, &metaInfo, infoHash, match, torrentID); err != nil {
+			log.Error().Err(err).Msgf("Could not import %s", torrentID)
+			if recordErr := run.record(torrentID, name, ResultFailed, err.Error()); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
-		if err = CopyFile(match, torrentOutFile); err != nil {
-			log.Error().Err(err).Msgf("Could not copy qBittorrent torrent file %s", torrentOutFile)
-			failed++
-			continue
+		if err := run.record(torrentID, name, ResultImported, ""); err != nil {
+			return err
 		}
 
-		imported++
-
-		log.Info().Msgf("(%d/%d) successfully imported: %s %s", positionNum, totalJobs, torrentID, metaInfo.Name)
+		log.Info().Msgf("(%d/%d) successfully imported: %s %s", positionNum, totalJobs, torrentID, name)
 	}
 
-	logImportSummary(i.opts.DryRun, imported, failed, skipped, totalJobs)
+	logImportSummary(i.opts.DryRun, run.importedThisRun, run.failedThisRun, run.skippedThisRun, totalJobs)
 
-	return nil
+	return run.finish()
 }
 
 // transmissionPieces expands the resume file's block bitfield into a qBittorrent

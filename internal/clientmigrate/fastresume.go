@@ -1,11 +1,13 @@
 package clientmigrate
 
 import (
-	"bufio"
-	"os"
-	"path/filepath"
+	"bytes"
+	"encoding/hex"
+	"strconv"
+	"strings"
 
 	"github.com/autobrr/go-torrent/bencode"
+	"github.com/autobrr/go-torrent/metainfo"
 
 	"github.com/pkg/errors"
 )
@@ -28,7 +30,7 @@ type Fastresume struct {
 	FileFormat                string     `bencode:"file-format"`
 	FileVersion               int64      `bencode:"file-version"`
 	FilePriority              []int      `bencode:"file_priority"`
-	FileSizes                 [][]int64  `bencode:"file sizes,omitempty"`
+	FileSizes                 [][]any    `bencode:"file sizes,omitempty"`
 	FinishedTime              int64      `bencode:"finished_time"`
 	HTTPSeeds                 []string   `bencode:"httpseeds,omitempty"`
 	InfoHash                  []byte     `bencode:"info-hash"`
@@ -44,6 +46,7 @@ type Fastresume struct {
 	NumIncomplete             int64      `bencode:"num_incomplete"`
 	Paused                    int64      `bencode:"paused"`
 	Pieces                    string     `bencode:"pieces"`
+	PieceLength               int64      `bencode:"piece length"`
 	PiecePriority             []byte     `bencode:"piece_priority"`
 	Peers                     string     `bencode:"peers"`
 	Peers6                    string     `bencode:"peers6"`
@@ -77,29 +80,93 @@ type Fastresume struct {
 	MappedFiles               []string   `bencode:"mapped_files,omitempty"`
 }
 
-// Encode qBittorrent fastresume file
-func (fr *Fastresume) Encode(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
-		return errors.Wrapf(err, "could not create directory for: %s", path)
+// setFileMeta stamps the torrent-identifying fields that the post-write
+// verification compares against the .torrent: piece length and libtorrent's
+// "file sizes" entries, each a [priority, decimal size] pair in torrent order
+func (fr *Fastresume) setFileMeta(info *metainfo.Info) {
+	fr.PieceLength = info.PieceLength
+
+	files := info.UpvertedFiles()
+	fileSizes := make([][]any, len(files))
+	for i, f := range files {
+		priority := int64(1)
+		if i < len(fr.FilePriority) {
+			priority = int64(fr.FilePriority[i])
+		}
+		fileSizes[i] = []any{priority, strconv.FormatInt(f.Length, 10)}
+	}
+	fr.FileSizes = fileSizes
+}
+
+// verifyResumeData re-decodes encoded fastresume bytes and checks the
+// torrent-identifying data against the metainfo: infohash, piece length,
+// piece count and the ordered file list. Any mismatch means the written
+// resume data must not be handed to qBittorrent.
+func verifyResumeData(dat []byte, info *metainfo.Info, wantHash []byte) error {
+	var fr Fastresume
+	if err := bencode.NewDecoder(bytes.NewReader(dat)).Decode(&fr); err != nil {
+		return errors.Wrap(err, "could not decode written resume data")
 	}
 
-	file, err := os.Create(path)
-	if err != nil {
-		return err
+	var problems []string
+
+	if len(wantHash) != 20 {
+		problems = append(problems, "torrent has no 20-byte v1 infohash")
+	} else if !bytes.Equal(fr.InfoHash, wantHash) {
+		gotHash := hex.EncodeToString(fr.InfoHash)
+		if gotHash == "" {
+			gotHash = "(empty)"
+		}
+		problems = append(problems, "infohash "+gotHash+" does not match torrent "+hex.EncodeToString(wantHash))
 	}
 
-	bufferedWriter := bufio.NewWriter(file)
-	if err := bencode.NewEncoder(bufferedWriter).Encode(fr); err != nil {
-		file.Close()
-		return errors.Wrapf(err, "could not encode fastresume: %s", path)
+	if fr.PieceLength != info.PieceLength {
+		problems = append(problems, "piece length "+strconv.FormatInt(fr.PieceLength, 10)+" does not match torrent "+strconv.FormatInt(info.PieceLength, 10))
 	}
 
-	if err := bufferedWriter.Flush(); err != nil {
-		file.Close()
-		return errors.Wrapf(err, "could not write fastresume: %s", path)
+	numPieces := info.NumPieces()
+	if len(fr.Pieces) != numPieces {
+		problems = append(problems, "piece count "+strconv.Itoa(len(fr.Pieces))+" does not match torrent "+strconv.Itoa(numPieces))
 	}
 
-	return file.Close()
+	files := info.UpvertedFiles()
+	if len(fr.FilePriority) != len(files) {
+		problems = append(problems, "file priority count "+strconv.Itoa(len(fr.FilePriority))+" does not match file count "+strconv.Itoa(len(files)))
+	}
+
+	if len(fr.FileSizes) != len(files) {
+		problems = append(problems, "file sizes count "+strconv.Itoa(len(fr.FileSizes))+" does not match file count "+strconv.Itoa(len(files)))
+	} else {
+		for i, entry := range fr.FileSizes {
+			if len(entry) != 2 {
+				problems = append(problems, "file sizes entry "+strconv.Itoa(i)+" is malformed")
+				continue
+			}
+			sizeStr, ok := entry[1].(string)
+			if !ok {
+				problems = append(problems, "file sizes entry "+strconv.Itoa(i)+" has a non-text size")
+				continue
+			}
+			size, err := strconv.ParseInt(sizeStr, 10, 64)
+			if err != nil {
+				problems = append(problems, "file sizes entry "+strconv.Itoa(i)+" has an unparseable size: "+sizeStr)
+				continue
+			}
+			if size != files[i].Length {
+				problems = append(problems, "file "+strconv.Itoa(i)+" size "+sizeStr+" does not match torrent "+strconv.FormatInt(files[i].Length, 10))
+			}
+		}
+	}
+
+	if len(fr.MappedFiles) > 0 && len(fr.MappedFiles) != len(files) {
+		problems = append(problems, "mapped files count "+strconv.Itoa(len(fr.MappedFiles))+" does not match file count "+strconv.Itoa(len(files)))
+	}
+
+	if len(problems) > 0 {
+		return errors.New("resume data mismatch: " + strings.Join(problems, "; "))
+	}
+
+	return nil
 }
 
 // ConvertFilePriority for each file set priority

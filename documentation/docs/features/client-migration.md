@@ -15,7 +15,7 @@ qui migrate {deluge | rtorrent | transmission} \
   --qbit-dir ~/.local/share/qBittorrent/BT_backup
 ```
 
-Run with `--dry-run` first to preview the import. The dry run writes nothing.
+Run with `--dry-run` first to preview the import. A dry run writes no `.torrent` or `.fastresume` files, but it does write a categorized report (`migration-report-<source>.dry-run.json`) into the qBittorrent directory so you can inspect what would happen.
 
 ## Before you start
 
@@ -23,9 +23,19 @@ Run with `--dry-run` first to preview the import. The dry run writes nothing.
 2. **Stop qBittorrent.** The importer writes into qBittorrent's `BT_backup` directory. qBittorrent reads that directory only at startup.
 3. After the migration finishes, start qBittorrent. The imported torrents appear with their history intact.
 
-If you do not set `--skip-backup`, the command archives both directories to `qbt_backup/` in the current working directory before it writes anything. If the qBittorrent directory already exists, the command archives it. A fresh destination produces only the source archive. If you run the migration again, the command safely skips torrents that already exist in the target.
+If you do not set `--skip-backup`, the command archives both directories to `qbt_backup/` in the current working directory before it writes anything. If the qBittorrent directory already exists, the command archives it. A fresh destination produces only the source archive.
 
 `--qbit-dir` is qBittorrent's session directory. Common locations: `~/.local/share/qBittorrent/BT_backup` on Linux, `%LOCALAPPDATA%\qBittorrent\BT_backup` on Windows, and `/config/qBittorrent/BT_backup` in Docker images.
+
+## Migration report and resuming a run
+
+Every run writes a structured report into the qBittorrent directory: `migration-report-<source>.json` (for example `migration-report-deluge.json`). It records one entry per torrent with its infohash, name, result (`imported`, `failed`, or `skipped`), the failure reason, and how many times qui tried it. The report is updated after every torrent, so it stays usable even if the run is killed.
+
+- Reruns read the previous report first. Torrents already recorded as `imported` are skipped by infohash and never written again, no matter what files happen to exist in `BT_backup`.
+- Failed torrents are retried on the next run; a success replaces their old failed entry.
+- Each `.torrent` and `.fastresume` is staged in a same-directory temp file, synced, and atomically renamed into place. A kill mid-write leaves no truncated file, and leftover temp files from a crashed run are removed on startup and never count as completed work.
+- Before a torrent is marked imported, qui re-decodes the fastresume it just wrote and verifies it against the torrent: infohash, piece length, piece count, and the ordered file list must all match. A mismatch records the torrent as failed with the reason and installs nothing.
+- The exit code reflects the result: the command exits non-zero when the final report still contains any `failed` entry. Skipped torrents (unsupported or incomplete) are not failures.
 
 :::warning
 The command carries over save paths from the source client without changes. qBittorrent must see the downloaded data at those same paths. If you move between machines or containers, keep the mount layout identical. Otherwise, the torrents show as missing files. Run the migration on the same OS family as the source client. You cannot import a Unix session directory on a Windows host.

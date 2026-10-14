@@ -130,7 +130,8 @@ This command replaces the qui binary in place. For Docker, pull a new image inst
 Import torrents with their state from Deluge, rTorrent, or Transmission into qBittorrent's `BT_backup` directory. See [Client Migration](../features/client-migration.md) for per-client details and what qui preserves.
 
 ```bash
-# Preview what the import would do, without writing anything
+# Preview what the import would do: it writes no .torrent/.fastresume files,
+# but still writes a categorized migration-report-<source>.dry-run.json into the qbit dir
 ./qui migrate transmission \
   --source-dir ~/.config/transmission-daemon \
   --qbit-dir ~/.local/share/qBittorrent/BT_backup \
@@ -157,7 +158,7 @@ Notes:
 - qui preserves these fields per torrent: save path, trackers, upload/download totals, added/completed timestamps, seeding time, paused state (Deluge 2.x only; Deluge 1.3.x imports start resumed), Transmission labels (as qBittorrent tags), Deluge and ruTorrent labels (as the qBittorrent category).
 - qui supports these source versions: Transmission 2.4-4.x, Deluge 1.3.x and 2.x, rTorrent 0.9.x through 0.16.x.
 - If you do not set `--skip-backup`, qui first archives both directories to `qbt_backup/` in the current working directory. If the qBittorrent directory already exists, qui archives it. A fresh destination produces only the source archive.
-- If a torrent already exists in the target `BT_backup`, qui skips it. You can run the command again.
+- Every run writes a `migration-report-<source>.json` audit report into the qBittorrent directory. Reruns skip torrents the previous report marked imported (by infohash) and retry failed ones. Artifacts are written atomically, and the command exits non-zero when any torrent is still failed. See [Client Migration](../features/client-migration.md#migration-report-and-resuming-a-run).
 
 ## Database migration (db migrate)
 

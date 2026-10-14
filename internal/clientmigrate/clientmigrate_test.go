@@ -422,27 +422,30 @@ func TestDelugeMigrateSkipsMismatchedInfoHash(t *testing.T) {
 
 	opts := Options{Source: "deluge", SourceDir: stateDir, QbitDir: qbitDir}
 
-	// valid length but belonging to different content: nothing is written
+	// valid length but belonging to different content: nothing is imported
 	writeResume(bytes.Repeat([]byte{0xaa}, 20))
 	if err := NewDelugeImporter(opts).Migrate(); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := os.ReadDir(qbitDir)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(qbitDir, torrentID+".torrent")); !os.IsNotExist(err) {
+		t.Fatalf("expected no imported torrent, stat err=%v", err)
 	}
-	assert.Empty(t, entries)
+	if _, err := os.Stat(filepath.Join(qbitDir, torrentID+".fastresume")); !os.IsNotExist(err) {
+		t.Fatalf("expected no imported fastresume, stat err=%v", err)
+	}
 
-	// control: the matching hash imports the torrent
+	// control: the matching hash imports the torrent (the skipped entry from the
+	// previous run is retried, only entries recorded as imported are skipped)
 	writeResume(mi.HashInfoBytes().Bytes())
 	if err := NewDelugeImporter(opts).Migrate(); err != nil {
 		t.Fatal(err)
 	}
-	entries, err = os.ReadDir(qbitDir)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(qbitDir, torrentID+".torrent")); err != nil {
+		t.Fatalf("expected imported torrent: %v", err)
 	}
-	assert.Len(t, entries, 2)
+	if _, err := os.Stat(filepath.Join(qbitDir, torrentID+".fastresume")); err != nil {
+		t.Fatalf("expected imported fastresume: %v", err)
+	}
 }
 
 func TestArchiveDirExcludesOwnArchive(t *testing.T) {

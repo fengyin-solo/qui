@@ -17,7 +17,8 @@ import (
 )
 
 type DelugeImport struct {
-	opts Options
+	opts   Options
+	commit commitFunc
 }
 
 func NewDelugeImporter(opts Options) *DelugeImport {
@@ -44,6 +45,11 @@ func (di *DelugeImport) Migrate() error {
 		if err := os.MkdirAll(di.opts.QbitDir, os.ModePerm); err != nil {
 			return errors.Wrapf(err, "qbit directory error: %s", di.opts.QbitDir)
 		}
+	}
+
+	run, err := newMigrateRun(di.opts, di.commit)
+	if err != nil {
+		return err
 	}
 
 	// deluge itself falls back to the .bak copy and the pre-1.3 location,
@@ -78,44 +84,45 @@ func (di *DelugeImport) Migrate() error {
 	log.Info().Msgf("Total torrents to process: %d", totalJobs)
 
 	positionNum := 0
-	imported := 0
-	failed := 0
-	skipped := 0
 	for _, torrentID := range slices.Sorted(maps.Keys(fastresumeFile)) {
 		value := fastresumeFile[torrentID]
+
+		// a previous run already imported this infohash; never write it again
+		if run.alreadyImported(torrentID) {
+			log.Info().Msgf("%s already imported in a previous run, skipping", torrentID)
+			run.skippedThisRun++
+			continue
+		}
 
 		torrentNamePath := filepath.Join(sourceDir, torrentID+".torrent")
 
 		// If a file exist in fastresume data but no .torrent file, skip
 		if _, err = os.Stat(torrentNamePath); os.IsNotExist(err) {
 			log.Error().Err(err).Msgf("%s: skipping because %s not found in source directory", torrentID, torrentNamePath)
-			failed++
+			if recordErr := run.record(torrentID, torrentID, ResultFailed, "source torrent file not found: "+torrentNamePath); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
 		positionNum++
-
-		torrentOutFile := filepath.Join(di.opts.QbitDir, torrentID+".torrent")
-
-		// If file already exists, skip
-		if _, err = os.Stat(torrentOutFile); err == nil {
-			log.Info().Msgf("(%d/%d) %s Torrent already exists, skipping", positionNum, totalJobs, torrentID)
-			skipped++
-			continue
-		}
 
 		var fastResume Fastresume
 
 		strValue, ok := value.(string)
 		if !ok {
 			log.Error().Msgf("Could not convert value %v to string", value)
-			failed++
+			if recordErr := run.record(torrentID, torrentID, ResultFailed, "deluge resume entry is not a string"); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
 		if err := bencode.NewDecoder(strings.NewReader(strValue)).Decode(&fastResume); err != nil {
 			log.Error().Err(err).Msgf("Could not decode row %s. Continue", torrentID)
-			failed++
+			if recordErr := run.record(torrentID, torrentID, ResultFailed, "could not decode deluge resume data: "+err.Error()); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
@@ -124,29 +131,40 @@ func (di *DelugeImport) Migrate() error {
 		file, err := metainfo.LoadFromFile(torrentNamePath)
 		if err != nil {
 			log.Error().Err(err).Msgf("Could not load torrent file %s for %s", fastResume.TorrentFilePath, torrentID)
-			failed++
+			if recordErr := run.record(torrentID, torrentID, ResultFailed, "could not load torrent file: "+err.Error()); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
 		metaInfo, err := file.UnmarshalInfo()
 		if err != nil {
 			log.Error().Err(err).Msgf("Could not unmarshal torrent file %s for %s", fastResume.TorrentFilePath, torrentID)
-			failed++
+			if recordErr := run.record(torrentID, torrentID, ResultFailed, "could not unmarshal torrent metadata: "+err.Error()); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
+
+		torrentName := metaInfo.BestName()
+		infoHash := file.HashInfoBytes().Bytes()
 
 		// v2-only torrents lose their merkle trees in this format;
 		// qBittorrent would reject or mis-verify them
 		if metaInfo.MetaVersion == 2 {
 			log.Warn().Msgf("(%d/%d) %s is a BitTorrent v2 torrent, not supported by this importer, skipping", positionNum, totalJobs, torrentID)
-			skipped++
+			if recordErr := run.record(torrentID, torrentName, ResultSkipped, "BitTorrent v2 torrent not supported"); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
 		// qBittorrent rejects resume data without an exact 20-byte v1 infohash
 		if len(fastResume.InfoHash) != 20 {
 			log.Warn().Msgf("(%d/%d) %s resume data has no valid v1 infohash, skipping", positionNum, totalJobs, torrentID)
-			skipped++
+			if recordErr := run.record(torrentID, torrentName, ResultSkipped, "resume data has no valid v1 infohash"); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
@@ -154,7 +172,9 @@ func (di *DelugeImport) Migrate() error {
 		// piece state for different content
 		if !bytes.Equal(fastResume.InfoHash, file.HashInfoBytes().Bytes()) {
 			log.Warn().Msgf("(%d/%d) %s resume data does not match the torrent file, skipping", positionNum, totalJobs, torrentID)
-			skipped++
+			if recordErr := run.record(torrentID, torrentName, ResultSkipped, "resume infohash does not match the torrent file"); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
@@ -162,7 +182,9 @@ func (di *DelugeImport) Migrate() error {
 		// qBittorrent resolves against its own default download dir
 		if !filepath.IsAbs(filepath.Clean(fastResume.SavePath)) {
 			log.Warn().Msgf("(%d/%d) %s has an unusable save path %q, skipping", positionNum, totalJobs, torrentID, fastResume.SavePath)
-			skipped++
+			if recordErr := run.record(torrentID, torrentName, ResultSkipped, "save path is not absolute: "+fastResume.SavePath); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
@@ -170,8 +192,10 @@ func (di *DelugeImport) Migrate() error {
 		// set; files with priority 0 may legitimately be missing
 		pieces, complete := delugePieces(&fastResume, &metaInfo)
 		if !complete {
-			log.Warn().Msgf("(%d/%d) %s is not fully downloaded, skipping: %s", positionNum, totalJobs, metaInfo.BestName(), torrentID)
-			skipped++
+			log.Warn().Msgf("(%d/%d) %s is not fully downloaded, skipping: %s", positionNum, totalJobs, torrentName, torrentID)
+			if recordErr := run.record(torrentID, torrentName, ResultSkipped, "torrent is not fully downloaded"); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
@@ -241,35 +265,37 @@ func (di *DelugeImport) Migrate() error {
 		fastResume.Pieces = pieces
 		fastResume.Unfinished = nil
 
+		// fields verified after writing: piece length and the ordered file list
+		fastResume.setFileMeta(&metaInfo)
+
 		// TODO handle replace paths
 
 		if di.opts.DryRun {
 			log.Info().Msgf("dry-run: (%d/%d) would import: %s", positionNum, totalJobs, torrentID)
-			imported++
+			if err := run.record(torrentID, torrentName, ResultImported, ""); err != nil {
+				return err
+			}
 			continue
 		}
 
-		fastResumeOutFile := filepath.Join(di.opts.QbitDir, torrentID+".fastresume")
-		if err = fastResume.Encode(fastResumeOutFile); err != nil {
-			log.Error().Err(err).Msgf("Could not create qBittorrent fastresume file %s", fastResumeOutFile)
-			failed++
+		if err = run.commit(&fastResume, &metaInfo, infoHash, torrentNamePath, torrentID); err != nil {
+			log.Error().Err(err).Msgf("Could not import %s", torrentID)
+			if recordErr := run.record(torrentID, torrentName, ResultFailed, err.Error()); recordErr != nil {
+				return recordErr
+			}
 			continue
 		}
 
-		if err = CopyFile(fastResume.TorrentFilePath, torrentOutFile); err != nil {
-			log.Error().Err(err).Msgf("Could not copy qBittorrent torrent file %s", torrentOutFile)
-			failed++
-			continue
+		if err := run.record(torrentID, torrentName, ResultImported, ""); err != nil {
+			return err
 		}
 
-		imported++
-
-		log.Info().Msgf("(%d/%d) successfully imported: %s %s", positionNum, totalJobs, torrentID, metaInfo.Name)
+		log.Info().Msgf("(%d/%d) successfully imported: %s %s", positionNum, totalJobs, torrentID, torrentName)
 	}
 
-	logImportSummary(di.opts.DryRun, imported, failed, skipped, totalJobs)
+	logImportSummary(di.opts.DryRun, run.importedThisRun, run.failedThisRun, run.skippedThisRun, totalJobs)
 
-	return nil
+	return run.finish()
 }
 
 // delugePieces converts the decoded libtorrent resume pieces (one byte per
