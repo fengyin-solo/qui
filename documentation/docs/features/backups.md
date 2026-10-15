@@ -41,6 +41,16 @@ This mode performs full reconciliation. It runs the overwrite steps and deletes 
 
 Every restore starts with a dry-run preview so you can inspect planned changes. qui displays unsupported differences, such as mismatched infohashes or file sizes, as warnings. These warnings require manual follow-up in all modes.
 
+## Restore runs
+
+Restores run asynchronously in a background queue, so a long restore is no longer tied to the browser request and cannot be cut off by a request timeout.
+
+- When you start a restore (including a dry run), qui creates a **restore run** and returns immediately. The dialog shows live progress (operations completed / total), a status badge, and an expandable **operation log**. A dry run only generates the plan and records it on the run; it changes nothing.
+- Only one restore runs at a time on a qBittorrent instance. Starting an identical restore while it is active tracks the existing run; starting a different one while the instance is busy is rejected with a "restore already active" message. Restores also serialize globally, so a restore on another instance queues behind the running one.
+- Use **Cancel** to stop a restore. Cancellation takes effect at the next safe boundary — between operations, never halfway through a qBittorrent call. A queued (not yet started) restore is canceled outright.
+- Every operation (create/update/delete categories and tags, add/update/delete torrents) is journaled with an outcome: pending, done, failed, or skipped. If one or more operations fail, the run ends as **failed** and the failures are listed in the operation log.
+- If qui exits while a restore is queued or running, that run is marked **interrupted** on the next startup instead of being retried automatically. Choose **Resume** to continue it: qui re-evaluates the plan against the current state and replays only the operations that have not already completed. Operations that already succeeded are never repeated, so resuming converges safely. A run whose snapshot or stored data is damaged is flagged as failed rather than resumed.
+
 ## Importing backups
 
 If you need to migrate to a new server or recover after data loss, you can import a downloaded backup into any qui instance. Click **Import backup** on the Backups page and select the backup file. qui supports all export formats.

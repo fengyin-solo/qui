@@ -5641,8 +5641,13 @@ paths:
     post:
       tags:
         - Backups
-      summary: Execute restore
-      description: Execute the restore plan for the specified backup run.
+      summary: Queue restore
+      description: >-
+        Queues an asynchronous restore run for the specified backup run. Returns
+        202 with the new run, 200 when an identical restore is already active (the
+        existing run is returned), or 409 when a different restore is already
+        active for the instance. Poll the restore run for progress; use the cancel
+        endpoint to stop at a safe boundary. A dry run only generates a plan.
       parameters:
         - $ref: '#/components/parameters/instanceID'
         - name: runId
@@ -5650,7 +5655,7 @@ paths:
           required: true
           schema:
             type: integer
-          description: Backup run ID
+          description: Snapshot backup run ID to restore from
       requestBody:
         description: Restore execution options
         required: true
@@ -5687,18 +5692,174 @@ paths:
                   description: Automatically resume torrents once qBittorrent reports them as fully verified. Defaults to true when skip recheck is enabled.
       responses:
         '200':
-          description: Restore executed successfully
+          description: An identical restore was already active; existing run returned
           content:
             application/json:
               schema:
-                type: object
-                description: Restore result payload
+                $ref: '#/components/schemas/RestoreEnqueueResponse'
+        '202':
+          description: Restore queued for background execution
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreEnqueueResponse'
         '400':
           description: Invalid request payload
         '404':
           description: Backup run not found
+        '409':
+          description: A different restore is already active for the instance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreEnqueueResponse'
         '500':
-          description: Failed to execute restore
+          description: Failed to queue restore
+
+  /api/instances/{instanceID}/backups/restore/runs:
+    get:
+      tags:
+        - Backups
+      summary: List restore runs
+      description: Lists restore runs for the instance, newest first.
+      parameters:
+        - $ref: '#/components/parameters/instanceID'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 25
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Restore runs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RestoreRun'
+        '500':
+          description: Failed to list restore runs
+
+  /api/instances/{instanceID}/backups/restore/runs/{restoreId}:
+    get:
+      tags:
+        - Backups
+      summary: Get restore run
+      description: Gets one restore run, including progress, plan, result and error.
+      parameters:
+        - $ref: '#/components/parameters/instanceID'
+        - name: restoreId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Restore run
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreRun'
+        '404':
+          description: Restore run not found
+        '500':
+          description: Failed to load restore run
+
+  /api/instances/{instanceID}/backups/restore/runs/{restoreId}/ops:
+    get:
+      tags:
+        - Backups
+      summary: List restore operations
+      description: Returns the operation journal for a restore run in execution order.
+      parameters:
+        - $ref: '#/components/parameters/instanceID'
+        - name: restoreId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Restore operations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ops:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RestoreRunOp'
+        '404':
+          description: Restore run not found
+        '500':
+          description: Failed to list restore operations
+
+  /api/instances/{instanceID}/backups/restore/runs/{restoreId}/cancel:
+    post:
+      tags:
+        - Backups
+      summary: Cancel restore run
+      description: >-
+        Requests cancellation. A queued run is skipped; a running restore stops at
+        its next operation boundary.
+      parameters:
+        - $ref: '#/components/parameters/instanceID'
+        - name: restoreId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Cancellation requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreRun'
+        '404':
+          description: Restore run not found
+        '409':
+          description: Restore run is not active
+
+  /api/instances/{instanceID}/backups/restore/runs/{restoreId}/resume:
+    post:
+      tags:
+        - Backups
+      summary: Resume restore run
+      description: >-
+        Re-queues an interrupted, failed or canceled restore. Already-succeeded
+        operations are not replayed; pending and failed operations are retried
+        against the current live state.
+      parameters:
+        - $ref: '#/components/parameters/instanceID'
+        - name: restoreId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '202':
+          description: Restore re-queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreRun'
+        '404':
+          description: Restore run not found
+        '409':
+          description: Restore is active or already completed successfully
 
   /api/instances/{instanceID}/backups/runs/{runId}/download:
     get:
@@ -9137,6 +9298,117 @@ components:
           items:
             type: string
           nullable: true
+
+    RestoreRun:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        instanceId:
+          type: integer
+        backupRunId:
+          type: integer
+          format: int64
+        mode:
+          type: string
+          enum: ["incremental", "overwrite", "complete"]
+        dryRun:
+          type: boolean
+        options:
+          type: object
+          properties:
+            startPaused:
+              type: boolean
+            skipHashCheck:
+              type: boolean
+            autoResumeVerified:
+              type: boolean
+            excludeHashes:
+              type: array
+              items:
+                type: string
+        status:
+          type: string
+          enum: ["queued", "running", "success", "failed", "canceled", "interrupted"]
+        requestedBy:
+          type: string
+        requestedAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        cancelRequested:
+          type: boolean
+        progressCurrent:
+          type: integer
+        progressTotal:
+          type: integer
+        planJson:
+          type: string
+          description: JSON-encoded RestorePlan.
+          nullable: true
+        resultJson:
+          type: string
+          description: JSON-encoded execution summary (applied, warnings, errors).
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    RestoreRunOp:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        restoreRunId:
+          type: integer
+          format: int64
+        seq:
+          type: integer
+        domain:
+          type: string
+          enum: ["category", "tag", "torrent"]
+        action:
+          type: string
+          enum: ["create", "update", "delete", "add", "set_category", "set_tags"]
+        target:
+          type: string
+          description: Category/tag name or torrent hash.
+        status:
+          type: string
+          enum: ["pending", "running", "succeeded", "failed", "skipped"]
+        message:
+          type: string
+          nullable: true
+        detailJson:
+          type: string
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+
+    RestoreEnqueueResponse:
+      type: object
+      properties:
+        run:
+          $ref: '#/components/schemas/RestoreRun'
+        busy:
+          type: boolean
+          description: True with HTTP 409 when a different restore is active.
 
     CategorySnapshot:
       type: object

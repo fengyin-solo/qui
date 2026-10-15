@@ -125,6 +125,12 @@ func NewBackupStore(db dbinterface.Querier) *BackupStore {
 	return &BackupStore{db: db}
 }
 
+// Querier exposes the underlying database handle so stores that share the same
+// database (e.g. RestoreStore) can be constructed alongside BackupStore.
+func (s *BackupStore) Querier() dbinterface.Querier {
+	return s.db
+}
+
 func (s *BackupStore) GetSettings(ctx context.Context, instanceID int) (*BackupSettings, error) {
 	query := `
         SELECT instance_id, enabled, hourly_enabled, daily_enabled, weekly_enabled, monthly_enabled,

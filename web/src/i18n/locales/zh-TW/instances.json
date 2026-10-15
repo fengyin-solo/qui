@@ -1735,9 +1735,48 @@
       "excludedToast": "已從還原中排除 {{name}}",
       "includedToast": "已包含 {{name}}",
       "includedAllToast": "已包含所有種子",
-      "dryRunCompleted": "還原模擬執行完成",
-      "executed": "還原已執行",
-      "failedToExecute": "執行還原失敗"
+      "failedToExecute": "執行還原失敗",
+      "queued": "Restore queued",
+      "busy": "A different restore is already running for this instance.",
+      "canceling": "Canceling restore at the next safe point...",
+      "failedToCancel": "Failed to cancel restore",
+      "failedToResume": "Failed to resume restore",
+      "runTitle": "Restore run",
+      "progress": "{{current}} / {{total}} operations",
+      "cancel": "Cancel",
+      "cancelQueued": "Cancel queued restore",
+      "cancelRequested": "Cancellation requested; the restore will stop after the current operation.",
+      "resume": "Resume",
+      "interruptedHint": "The process exited mid-restore. Resume to finish the remaining operations; completed operations are not repeated.",
+      "operationLog": "Operation log ({{count}})",
+      "status": {
+        "queued": "Queued",
+        "running": "Running",
+        "success": "Completed",
+        "failed": "Failed",
+        "canceled": "Canceled",
+        "interrupted": "Interrupted"
+      },
+      "opStatus": {
+        "pending": "Pending",
+        "running": "Running",
+        "succeeded": "Done",
+        "failed": "Failed",
+        "skipped": "Skipped"
+      },
+      "opDomain": {
+        "category": "Category",
+        "tag": "Tag",
+        "torrent": "Torrent"
+      },
+      "opAction": {
+        "create": "create",
+        "update": "update",
+        "delete": "delete",
+        "add": "add",
+        "set_category": "set category",
+        "set_tags": "set tags"
+      }
     },
     "import": {
       "title": "匯入備份",

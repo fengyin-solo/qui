@@ -173,8 +173,73 @@ export interface RestoreResult {
   runId: number
   instanceId: number
   dryRun: boolean
-  plan: RestorePlan
+  plan?: RestorePlan
   applied: RestoreAppliedTotals
   warnings?: string[]
   errors?: RestoreErrorItem[]
+}
+
+export type RestoreRunStatus =
+  | "queued"
+  | "running"
+  | "success"
+  | "failed"
+  | "canceled"
+  | "interrupted"
+
+export type RestoreOpStatus = "pending" | "running" | "succeeded" | "failed" | "skipped"
+
+export interface RestoreRunOptions {
+  startPaused?: boolean
+  skipHashCheck?: boolean
+  autoResumeVerified?: boolean
+  excludeHashes?: string[]
+}
+
+export interface RestoreRun {
+  id: number
+  instanceId: number
+  backupRunId: number
+  mode: RestoreMode
+  dryRun: boolean
+  options: RestoreRunOptions
+  status: RestoreRunStatus
+  requestedBy: string
+  requestedAt: string
+  startedAt?: string | null
+  completedAt?: string | null
+  error?: string | null
+  cancelRequested: boolean
+  progressCurrent: number
+  progressTotal: number
+  planJson?: string | null
+  resultJson?: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface RestoreRunOp {
+  id: number
+  restoreRunId: number
+  seq: number
+  domain: "category" | "tag" | "torrent"
+  action: "create" | "update" | "delete" | "add" | "set_category" | "set_tags"
+  target: string
+  status: RestoreOpStatus
+  message?: string | null
+  detailJson?: string | null
+  updatedAt: string
+}
+
+export interface RestoreEnqueueResponse {
+  run: RestoreRun
+  busy: boolean
+}
+
+export interface RestoreRunsResponse {
+  runs: RestoreRun[]
+}
+
+export interface RestoreOpsResponse {
+  ops: RestoreRunOp[]
 }

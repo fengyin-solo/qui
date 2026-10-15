@@ -19,6 +19,7 @@ import {
 // kind (and thus a feed family left out of ACTIVITY_FEATURE_PREFIXES).
 const ALL_KINDS_MAP = {
   "backup.run": true,
+  "restore.run": true,
   "dirscan.run": true,
   "orphanscan.run": true,
   "discscan.run": true,
@@ -46,6 +47,7 @@ function ev(partial: Partial<ActivityEvent> & Pick<ActivityEvent, "kind">): Acti
 describe("activityQueryKeys", () => {
   it("scopes instance-keyed feeds by instanceId when present", () => {
     expect(activityQueryKeys(ev({ kind: "backup.run", instanceId: 5 }))).toEqual([["instance-backups", 5]])
+    expect(activityQueryKeys(ev({ kind: "restore.run", instanceId: 5 }))).toEqual([["instance-restore-runs", 5]])
     expect(activityQueryKeys(ev({ kind: "orphanscan.run", instanceId: 3 }))).toEqual([["orphan-scan", 3]])
     expect(activityQueryKeys(ev({ kind: "discscan.run", instanceId: 3, resourceId: "7" }))).toEqual([["disc-scans", 3]])
     expect(activityQueryKeys(ev({ kind: "reannounce.activity", instanceId: 9 }))).toEqual([["instance-reannounce-activity", 9]])
@@ -54,6 +56,7 @@ describe("activityQueryKeys", () => {
 
   it("falls back to the feature prefix when no instanceId is present", () => {
     expect(activityQueryKeys(ev({ kind: "backup.run" }))).toEqual([["instance-backups"]])
+    expect(activityQueryKeys(ev({ kind: "restore.run" }))).toEqual([["instance-restore-runs"]])
     expect(activityQueryKeys(ev({ kind: "orphanscan.run" }))).toEqual([["orphan-scan"]])
   })
 

@@ -1230,7 +1230,15 @@ func (h *BackupsHandler) PreviewRestore(w http.ResponseWriter, r *http.Request) 
 	RespondJSON(w, http.StatusOK, plan)
 }
 
-func (h *BackupsHandler) ExecuteRestore(w http.ResponseWriter, r *http.Request) {
+// restoreEnqueueResponse is returned when an instance already has an active but
+// non-identical restore: 409 carries the conflicting run so the client can track
+// it instead of firing another request.
+type restoreEnqueueResponse struct {
+	Run  *models.RestoreRun `json:"run"`
+	Busy bool               `json:"busy"`
+}
+
+func (h *BackupsHandler) QueueRestore(w http.ResponseWriter, r *http.Request) {
 	instanceID, err := strconv.Atoi(chi.URLParam(r, "instanceID"))
 	if err != nil {
 		RespondError(w, http.StatusBadRequest, "Invalid instance ID")
@@ -1274,19 +1282,198 @@ func (h *BackupsHandler) ExecuteRestore(w http.ResponseWriter, r *http.Request) 
 		autoResume = *req.AutoResumeVerified
 	}
 
-	result, err := h.service.ExecuteRestore(r.Context(), runID, mode, backups.RestoreOptions{
-		DryRun:             req.DryRun,
-		StartPaused:        startPaused,
-		SkipHashCheck:      skipHashCheck,
-		AutoResumeVerified: autoResume,
-		ExcludeHashes:      req.ExcludeHashes,
+	restoreRun, reused, err := h.service.QueueRestoreRun(r.Context(), backups.RestoreRequest{
+		InstanceID:  instanceID,
+		BackupRunID: runID,
+		Mode:        mode,
+		Options: backups.RestoreOptions{
+			DryRun:             req.DryRun,
+			StartPaused:        startPaused,
+			SkipHashCheck:      skipHashCheck,
+			AutoResumeVerified: autoResume,
+			ExcludeHashes:      req.ExcludeHashes,
+		},
+		RequestedBy: "api",
 	})
 	if err != nil {
-		RespondError(w, http.StatusInternalServerError, "Failed to execute restore")
+		if errors.Is(err, backups.ErrRestoreInstanceBusy) {
+			RespondJSON(w, http.StatusConflict, restoreEnqueueResponse{Run: restoreRun, Busy: true})
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			RespondError(w, http.StatusNotFound, "Backup run not found")
+			return
+		}
+		RespondError(w, http.StatusInternalServerError, "Failed to queue restore")
 		return
 	}
 
-	RespondJSON(w, http.StatusOK, result)
+	status := http.StatusAccepted
+	if reused {
+		status = http.StatusOK
+	}
+	RespondJSON(w, status, restoreEnqueueResponse{Run: restoreRun, Busy: false})
+}
+
+type restoreRunsResponse struct {
+	Runs []*models.RestoreRun `json:"runs"`
+}
+
+type restoreOpsResponse struct {
+	Ops []*models.RestoreRunOp `json:"ops"`
+}
+
+func (h *BackupsHandler) ListRestoreRuns(w http.ResponseWriter, r *http.Request) {
+	instanceID, err := strconv.Atoi(chi.URLParam(r, "instanceID"))
+	if err != nil {
+		RespondError(w, http.StatusBadRequest, "Invalid instance ID")
+		return
+	}
+
+	limit, offset := 25, 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 && parsed <= 100 {
+			limit = parsed
+		}
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
+
+	runs, err := h.service.ListRestoreRuns(r.Context(), instanceID, limit, offset)
+	if err != nil {
+		RespondError(w, http.StatusInternalServerError, "Failed to list restore runs")
+		return
+	}
+
+	for _, run := range runs {
+		h.mergeRestoreProgress(r, run)
+	}
+
+	RespondJSON(w, http.StatusOK, restoreRunsResponse{Runs: runs})
+}
+
+func (h *BackupsHandler) GetRestoreRun(w http.ResponseWriter, r *http.Request) {
+	instanceID, restoreID, ok := h.parseRestoreRunRequest(w, r)
+	if !ok {
+		return
+	}
+
+	run, err := h.service.GetRestoreRun(r.Context(), restoreID)
+	if err != nil {
+		h.respondRestoreRunError(w, err)
+		return
+	}
+	if run.InstanceID != instanceID {
+		RespondError(w, http.StatusNotFound, "Restore run not found")
+		return
+	}
+
+	h.mergeRestoreProgress(r, run)
+	RespondJSON(w, http.StatusOK, run)
+}
+
+func (h *BackupsHandler) ListRestoreOps(w http.ResponseWriter, r *http.Request) {
+	instanceID, restoreID, ok := h.parseRestoreRunRequest(w, r)
+	if !ok {
+		return
+	}
+
+	run, err := h.service.GetRestoreRun(r.Context(), restoreID)
+	if err != nil {
+		h.respondRestoreRunError(w, err)
+		return
+	}
+	if run.InstanceID != instanceID {
+		RespondError(w, http.StatusNotFound, "Restore run not found")
+		return
+	}
+
+	ops, err := h.service.ListRestoreOps(r.Context(), restoreID)
+	if err != nil {
+		RespondError(w, http.StatusInternalServerError, "Failed to list restore operations")
+		return
+	}
+
+	RespondJSON(w, http.StatusOK, restoreOpsResponse{Ops: ops})
+}
+
+func (h *BackupsHandler) CancelRestoreRun(w http.ResponseWriter, r *http.Request) {
+	instanceID, restoreID, ok := h.parseRestoreRunRequest(w, r)
+	if !ok {
+		return
+	}
+
+	run, err := h.service.CancelRestoreRun(r.Context(), restoreID)
+	if err != nil {
+		h.respondRestoreRunError(w, err)
+		return
+	}
+	if run.InstanceID != instanceID {
+		RespondError(w, http.StatusNotFound, "Restore run not found")
+		return
+	}
+
+	RespondJSON(w, http.StatusOK, run)
+}
+
+func (h *BackupsHandler) ResumeRestoreRun(w http.ResponseWriter, r *http.Request) {
+	instanceID, restoreID, ok := h.parseRestoreRunRequest(w, r)
+	if !ok {
+		return
+	}
+
+	run, err := h.service.ResumeRestoreRun(r.Context(), restoreID)
+	if err != nil {
+		h.respondRestoreRunError(w, err)
+		return
+	}
+	if run.InstanceID != instanceID {
+		RespondError(w, http.StatusNotFound, "Restore run not found")
+		return
+	}
+
+	RespondJSON(w, http.StatusAccepted, run)
+}
+
+// mergeRestoreProgress overlays the worker's in-memory progress counters onto a
+// persisted run so pollers see progress between throttled database flushes.
+func (h *BackupsHandler) mergeRestoreProgress(r *http.Request, run *models.RestoreRun) {
+	if !strings.EqualFold(string(run.Status), string(models.RestoreStatusQueued)) &&
+		!strings.EqualFold(string(run.Status), string(models.RestoreStatusRunning)) {
+		return
+	}
+	if progress := h.service.GetRestoreRunProgress(r.Context(), run.ID); progress != nil {
+		run.ProgressCurrent = progress.Current
+		run.ProgressTotal = progress.Total
+	}
+}
+
+func (h *BackupsHandler) parseRestoreRunRequest(w http.ResponseWriter, r *http.Request) (int, int64, bool) {
+	instanceID, err := strconv.Atoi(chi.URLParam(r, "instanceID"))
+	if err != nil {
+		RespondError(w, http.StatusBadRequest, "Invalid instance ID")
+		return 0, 0, false
+	}
+	restoreID, err := strconv.ParseInt(chi.URLParam(r, "restoreID"), 10, 64)
+	if err != nil {
+		RespondError(w, http.StatusBadRequest, "Invalid restore run ID")
+		return 0, 0, false
+	}
+	return instanceID, restoreID, true
+}
+
+func (h *BackupsHandler) respondRestoreRunError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		RespondError(w, http.StatusNotFound, "Restore run not found")
+	case errors.Is(err, backups.ErrRestoreNotActive), errors.Is(err, backups.ErrRestoreInstanceBusy):
+		RespondError(w, http.StatusConflict, err.Error())
+	default:
+		RespondError(w, http.StatusInternalServerError, "Restore run unavailable")
+	}
 }
 
 func (h *BackupsHandler) ensureRunOwnership(ctx context.Context, instanceID int, runID int64) error {

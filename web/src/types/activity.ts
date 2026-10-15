@@ -7,6 +7,7 @@
 // the react-query keys the frontend invalidates when the event arrives.
 export type ActivityEventKind =
   | "backup.run"
+  | "restore.run"
   | "dirscan.run"
   | "orphanscan.run"
   | "discscan.run"

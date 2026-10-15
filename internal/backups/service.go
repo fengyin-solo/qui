@@ -88,6 +88,17 @@ type Service struct {
 	progress   map[int64]*BackupProgress
 	progressMu sync.RWMutex
 
+	// Async restore queue. A single worker serializes restores across every
+	// instance; restoreInflight additionally enforces one restore per instance.
+	restoreStore      *models.RestoreStore
+	restoreJobs       chan restoreJob
+	restoreInflight   map[int]int64
+	restoreInflightMu sync.Mutex
+	restoreProgress   map[int64]*BackupProgress
+	restoreProgressMu sync.RWMutex
+	restoreCancels    map[int64]context.CancelFunc
+	restoreCancelsMu  sync.Mutex
+
 	now func() time.Time
 
 	activityPublisher activity.Publisher
@@ -180,17 +191,27 @@ func NewService(store *models.BackupStore, reader backupReader, cfg Config, noti
 		}
 	}
 
+	var restoreStore *models.RestoreStore
+	if store != nil {
+		restoreStore = models.NewRestoreStore(store.Querier())
+	}
+
 	svc := &Service{
-		store:    store,
-		reader:   reader,
-		notifier: notifier,
-		cfg:      cfg,
-		root:     root,
-		cacheDir: cacheDir,
-		jobs:     make(chan job, cfg.WorkerCount*2),
-		inflight: make(map[int]int64),
-		progress: make(map[int64]*BackupProgress),
-		now:      func() time.Time { return time.Now().UTC() },
+		store:           store,
+		reader:          reader,
+		notifier:        notifier,
+		cfg:             cfg,
+		root:            root,
+		cacheDir:        cacheDir,
+		jobs:            make(chan job, cfg.WorkerCount*2),
+		inflight:        make(map[int]int64),
+		progress:        make(map[int64]*BackupProgress),
+		restoreStore:    restoreStore,
+		restoreJobs:     make(chan restoreJob, restoreQueueBuffer),
+		restoreInflight: make(map[int]int64),
+		restoreProgress: make(map[int64]*BackupProgress),
+		restoreCancels:  make(map[int64]context.CancelFunc),
+		now:             func() time.Time { return time.Now().UTC() },
 
 		activityPublisher: activity.NopPublisher{},
 	}
@@ -231,6 +252,18 @@ func (s *Service) emitRunActivity(instanceID int, runID int64) {
 		Kind:       activity.KindBackupRun,
 		InstanceID: instanceID,
 		ResourceID: strconv.FormatInt(runID, 10),
+	})
+}
+
+// emitRestoreRunActivity signals clients that a restore run changed state.
+func (s *Service) emitRestoreRunActivity(instanceID int, restoreRunID int64) {
+	if s == nil || s.activityPublisher == nil {
+		return
+	}
+	s.activityPublisher.Publish(activity.Event{
+		Kind:       activity.KindRestoreRun,
+		InstanceID: instanceID,
+		ResourceID: strconv.FormatInt(restoreRunID, 10),
 	})
 }
 
@@ -308,6 +341,14 @@ func (s *Service) Start(ctx context.Context) {
 	if err := s.recoverIncompleteRuns(ctx); err != nil {
 		log.Warn().Err(err).Msg("Failed to recover incomplete backup runs")
 	}
+
+	// Mark restores interrupted by a previous shutdown; they are only replayed
+	// when the user explicitly resumes them.
+	s.recoverInterruptedRestoreRuns(ctx)
+
+	// Single restore worker serializes restores across all instances.
+	s.wg.Add(1)
+	go s.restoreWorker(ctx)
 
 	// Reclaim cache blobs stranded by failed runs before workers start
 	// writing, but off the startup path so a large cache cannot hold up the
@@ -522,6 +563,11 @@ func (s *Service) checkMissedBackups(ctx context.Context) error {
 
 func (s *Service) Stop() {
 	s.once.Do(func() {
+		// Queued restores never started: cancel them up front so the worker can
+		// drain the channel. The running restore is canceled via s.cancel and is
+		// allowed to reach its next operation boundary before the worker exits.
+		s.cancelQueuedRestores()
+
 		if s.cancel != nil {
 			s.cancel()
 		}

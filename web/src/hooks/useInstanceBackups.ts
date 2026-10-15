@@ -7,7 +7,7 @@ import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tansta
 
 import { useActivityStream } from "@/contexts/SyncStreamContext"
 import { api } from "@/lib/api"
-import type { BackupRun, BackupRunsResponse, BackupSettings, RestoreMode, RestorePlan, RestoreResult } from "@/types"
+import type { BackupRun, BackupRunsResponse, BackupSettings, RestoreMode, RestorePlan } from "@/types"
 
 export function useBackupSettings(instanceId: number, options?: { enabled?: boolean }) {
   const shouldEnable = (options?.enabled ?? true) && instanceId > 0
@@ -139,18 +139,6 @@ export function useDeleteAllBackupRuns(instanceId: number) {
 export function usePreviewRestore(instanceId: number) {
   return useMutation<RestorePlan, Error, { runId: number; mode: RestoreMode; excludeHashes?: string[] }>({
     mutationFn: ({ runId, mode, excludeHashes }) => api.previewRestore(instanceId, runId, { mode, excludeHashes }),
-  })
-}
-
-export function useExecuteRestore(instanceId: number) {
-  const queryClient = useQueryClient()
-
-  return useMutation<RestoreResult, Error, { runId: number; mode: RestoreMode; dryRun: boolean; excludeHashes?: string[]; startPaused?: boolean; skipHashCheck?: boolean; autoResumeVerified?: boolean }>({
-    mutationFn: ({ runId, mode, dryRun, excludeHashes, startPaused, skipHashCheck, autoResumeVerified }) =>
-      api.executeRestore(instanceId, runId, { mode, dryRun, excludeHashes, startPaused, skipHashCheck, autoResumeVerified }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["instance-backups", instanceId, "runs"] })
-    },
   })
 }
 

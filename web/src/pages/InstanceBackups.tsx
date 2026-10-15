@@ -69,16 +69,23 @@ import {
   useBackupSettings,
   useDeleteAllBackupRuns,
   useDeleteBackupRun,
-  useExecuteRestore,
   useImportBackupManifest,
   usePreviewRestore,
   useTriggerBackup,
   useUpdateBackupSettings
 } from "@/hooks/useInstanceBackups"
+import {
+  isRestoreActive,
+  useCancelRestoreRun,
+  useEnqueueRestore,
+  useResumeRestoreRun,
+  useRestoreOps,
+  useRestoreRun
+} from "@/hooks/useRestoreRuns"
 import { useInstanceCapabilities } from "@/hooks/useInstanceCapabilities"
 import { useInstances } from "@/hooks/useInstances"
 import { usePersistedInstanceSelection } from "@/hooks/usePersistedInstanceSelection"
-import { api } from "@/lib/api"
+import { api, APIError } from "@/lib/api"
 import type {
   BackupCategorySnapshot,
   BackupRun,
@@ -88,7 +95,9 @@ import type {
   RestoreDiffChange,
   RestoreMode,
   RestorePlan,
-  RestoreResult
+  RestoreResult,
+  RestoreRun,
+  RestoreRunOp
 } from "@/types"
 import { useQueries, useQueryClient } from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
@@ -252,7 +261,9 @@ export function InstanceBackups() {
   const deleteRun = useDeleteBackupRun(instanceId ?? 0)
   const deleteAllRuns = useDeleteAllBackupRuns(instanceId ?? 0)
   const previewRestore = usePreviewRestore(instanceId ?? 0)
-  const executeRestore = useExecuteRestore(instanceId ?? 0)
+  const enqueueRestore = useEnqueueRestore(instanceId ?? 0)
+  const cancelRestore = useCancelRestoreRun(instanceId ?? 0)
+  const resumeRestore = useResumeRestoreRun(instanceId ?? 0)
   const importManifest = useImportBackupManifest(instanceId ?? 0)
   const { formatDate } = useDateTimeFormatters()
 
@@ -271,8 +282,36 @@ export function InstanceBackups() {
   const [restorePlan, setRestorePlan] = useState<RestorePlan | null>(null)
   const [restorePlanLoading, setRestorePlanLoading] = useState(false)
   const [restorePlanError, setRestorePlanError] = useState<string | null>(null)
-  const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null)
   const [restoreExcludedHashes, setRestoreExcludedHashes] = useState<string[]>([])
+  const [restoreRunId, setRestoreRunId] = useState<number | null>(null)
+
+  const activeRestoreRun = useRestoreRun(instanceId ?? 0, restoreRunId)
+  const activeRestore: RestoreRun | null = restoreRunId ? activeRestoreRun.data ?? null : null
+  const restoreActive = isRestoreActive(activeRestore)
+  const activeRestoreOps = useRestoreOps(instanceId ?? 0, restoreRunId, {
+    enabled: !!restoreRunId,
+    refetchInterval: restoreActive ? 500 : false,
+  })
+  const activeRestoreOpsList: RestoreRunOp[] = activeRestoreOps.data?.ops ?? []
+
+  // The execution summary lives on the run once it reaches a terminal state.
+  const restoreResult: RestoreResult | null = useMemo(() => {
+    if (!activeRestore?.resultJson) return null
+    try {
+      const parsed = JSON.parse(activeRestore.resultJson) as Partial<RestoreResult>
+      return {
+        mode: activeRestore.mode,
+        runId: activeRestore.backupRunId,
+        instanceId: activeRestore.instanceId,
+        dryRun: activeRestore.dryRun,
+        applied: parsed.applied ?? { categories: {}, tags: {}, torrents: {} },
+        warnings: parsed.warnings,
+        errors: parsed.errors,
+      }
+    } catch {
+      return null
+    }
+  }, [activeRestore])
 
   const [importDialogOpen, setImportDialogOpen] = useState(false)
   const [importFile, setImportFile] = useState<File | null>(null)
@@ -685,7 +724,7 @@ export function InstanceBackups() {
     setRestoreStartPaused(true)
     setRestoreSkipHashCheck(true)
     setRestoreAutoResume(true)
-    setRestoreResult(null)
+    setRestoreRunId(null)
     setRestorePlan(null)
     setRestorePlanError(null)
     setRestoreExcludedHashes([])
@@ -697,7 +736,7 @@ export function InstanceBackups() {
     if (!restoreTargetRun) return
     const nextMode = value as RestoreMode
     setRestoreMode(nextMode)
-    setRestoreResult(null)
+    setRestoreRunId(null)
     setRestoreExcludedHashes([])
     await loadRestorePlan(nextMode, restoreTargetRun, [], { reset: true })
   }
@@ -743,7 +782,7 @@ export function InstanceBackups() {
   const handleExecuteRestore = async () => {
     if (!restoreTargetRun) return
     try {
-      const result = await executeRestore.mutateAsync({
+      const response = await enqueueRestore.mutateAsync({
         runId: restoreTargetRun.id,
         mode: restoreMode,
         dryRun: restoreDryRun,
@@ -752,13 +791,42 @@ export function InstanceBackups() {
         skipHashCheck: restoreSkipHashCheck,
         autoResumeVerified: restoreSkipHashCheck ? restoreAutoResume : false,
       })
-      setRestoreResult(result)
-      setRestorePlan(result.plan)
-      setRestorePlanError(null)
-      const message = restoreDryRun ? t("backups.restore.dryRunCompleted") : t("backups.restore.executed")
-      toast.success(message)
+      setRestoreRunId(response.run.id)
+      toast.success(t("backups.restore.queued"))
     } catch (error) {
+      // A different restore already holds the instance: track it instead of
+      // firing a duplicate request.
+      if (error instanceof APIError && error.status === 409) {
+        const busyRun = (error.data as { run?: RestoreRun } | undefined)?.run
+        if (busyRun) {
+          setRestoreRunId(busyRun.id)
+          toast.info(t("backups.restore.busy"))
+          return
+        }
+      }
       const message = error instanceof Error ? error.message : t("backups.restore.failedToExecute")
+      toast.error(message)
+    }
+  }
+
+  const handleCancelRestore = async () => {
+    if (restoreRunId == null) return
+    try {
+      await cancelRestore.mutateAsync(restoreRunId)
+      toast.info(t("backups.restore.canceling"))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t("backups.restore.failedToCancel")
+      toast.error(message)
+    }
+  }
+
+  const handleResumeRestore = async () => {
+    if (restoreRunId == null) return
+    try {
+      await resumeRestore.mutateAsync(restoreRunId)
+      toast.success(t("backups.restore.queued"))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t("backups.restore.failedToResume")
       toast.error(message)
     }
   }
@@ -768,13 +836,15 @@ export function InstanceBackups() {
     setRestoreTargetRun(null)
     setRestorePlan(null)
     setRestorePlanError(null)
-    setRestoreResult(null)
+    setRestoreRunId(null)
     setRestoreExcludedHashes([])
     setRestoreStartPaused(true)
     setRestoreSkipHashCheck(true)
     setRestoreAutoResume(true)
     previewRestore.reset()
-    executeRestore.reset()
+    enqueueRestore.reset()
+    cancelRestore.reset()
+    resumeRestore.reset()
   }
 
   // Show instance selector when no instance is selected
@@ -1268,16 +1338,117 @@ export function InstanceBackups() {
                 </Button>
                 <Button
                   onClick={handleExecuteRestore}
-                  disabled={!restoreTargetRun || restorePlanLoading || executeRestore.isPending}
+                  disabled={!restoreTargetRun || restorePlanLoading || enqueueRestore.isPending || restoreActive}
                 >
-                  {executeRestore.isPending ? t("backups.restore.executing") : restoreDryRun ? t("backups.restore.runDryRun") : t("backups.restore.execute")}
+                  {enqueueRestore.isPending ? t("backups.restore.executing") : restoreDryRun ? t("backups.restore.runDryRun") : t("backups.restore.execute")}
                 </Button>
               </div>
             </div>
 
             <Separator />
 
+            {activeRestore ? (
+              <div className="rounded-md border p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h4 className="text-sm font-semibold">{t("backups.restore.runTitle")}</h4>
+                  <Badge
+                    variant={
+                      activeRestore.status === "success"
+                        ? "default"
+                        : activeRestore.status === "failed"
+                          ? "destructive"
+                          : "secondary"
+                    }
+                    className="text-xs"
+                  >
+                    {t(`backups.restore.status.${activeRestore.status}`)}
+                  </Badge>
+                </div>
 
+                {isRestoreActive(activeRestore) ? (
+                  <div className="space-y-2">
+                    <Progress value={activeRestore.progressTotal > 0
+                      ? Math.round((activeRestore.progressCurrent / activeRestore.progressTotal) * 100)
+                      : 0}
+                    />
+                    <div className="flex items-center justify-between text-xs text-muted-foreground">
+                      <span>
+                        {t("backups.restore.progress", {
+                          current: activeRestore.progressCurrent,
+                          total: activeRestore.progressTotal,
+                        })}
+                      </span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleCancelRestore}
+                        disabled={cancelRestore.isPending || activeRestore.cancelRequested}
+                      >
+                        {activeRestore.status === "queued"
+                          ? t("backups.restore.cancelQueued")
+                          : t("backups.restore.cancel")}
+                      </Button>
+                    </div>
+                    {activeRestore.cancelRequested ? (
+                      <p className="text-xs text-muted-foreground">{t("backups.restore.cancelRequested")}</p>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {activeRestore.error ? (
+                  <p className="text-sm text-destructive">{activeRestore.error}</p>
+                ) : null}
+
+                {(activeRestore.status === "failed" ||
+                  activeRestore.status === "canceled" ||
+                  activeRestore.status === "interrupted") ? (
+                    <div className="flex items-center gap-2">
+                      <Button variant="outline" size="sm" onClick={handleResumeRestore} disabled={resumeRestore.isPending}>
+                        {t("backups.restore.resume")}
+                      </Button>
+                      {activeRestore.status === "interrupted" ? (
+                        <span className="text-xs text-muted-foreground">{t("backups.restore.interruptedHint")}</span>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                {activeRestoreOpsList.length > 0 ? (
+                  <details className="text-xs">
+                    <summary className="cursor-pointer text-muted-foreground">
+                      {t("backups.restore.operationLog", { count: activeRestoreOpsList.length })}
+                    </summary>
+                    <ul className="mt-2 max-h-40 overflow-y-auto space-y-1">
+                      {activeRestoreOpsList
+                        .filter(op => op.status === "failed")
+                        .map(op => (
+                          <li key={op.id} className="flex flex-wrap items-center gap-2 text-destructive">
+                            <Badge variant="destructive" className="text-[10px] uppercase">
+                              {t(`backups.restore.opStatus.${op.status}`)}
+                            </Badge>
+                            <span>
+                              {t(`backups.restore.opDomain.${op.domain}`)} · {t(`backups.restore.opAction.${op.action}`)} · {op.target}
+                            </span>
+                            {op.message ? <span className="text-muted-foreground">— {op.message}</span> : null}
+                          </li>
+                        ))}
+                      {activeRestoreOpsList
+                        .filter(op => op.status !== "failed")
+                        .slice(-10)
+                        .map(op => (
+                          <li key={op.id} className="flex items-center gap-2 text-muted-foreground">
+                            <Badge variant="outline" className="text-[10px] uppercase">
+                              {t(`backups.restore.opStatus.${op.status}`)}
+                            </Badge>
+                            <span>
+                              {t(`backups.restore.opDomain.${op.domain}`)} · {t(`backups.restore.opAction.${op.action}`)} · {op.target}
+                            </span>
+                          </li>
+                        ))}
+                    </ul>
+                  </details>
+                ) : null}
+              </div>
+            ) : null}
 
             <div className="flex-1 overflow-y-auto space-y-6">
               {!restorePlan && restorePlanLoading ? (
@@ -1768,7 +1939,7 @@ export function InstanceBackups() {
                     variant="default"
                     size="sm"
                     onClick={() => latestCompletedRun && openRestore(latestCompletedRun)}
-                    disabled={!latestCompletedRun || executeRestore.isPending || runsLoading}
+                    disabled={!latestCompletedRun || enqueueRestore.isPending || runsLoading}
                   >
                     <Undo2 className="mr-2 h-4 w-4" /> {t("backups.history.restoreFromLatest")}
                   </Button>

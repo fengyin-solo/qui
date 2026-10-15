@@ -70,7 +70,7 @@ func runRestoreAdd(t *testing.T, manifest ManifestItem) (map[string]string, []st
 
 	applied := RestoreApplied{}
 	var errs []RestoreError
-	warnings, err := svc.applyTorrentPlan(context.Background(), plan, &applied, &errs, nil, RestoreOptions{SkipHashCheck: true})
+	warnings, err := svc.applyTorrentPlan(context.Background(), plan, &applied, &errs, nil, RestoreOptions{SkipHashCheck: true}, nopRestoreHook{})
 	require.NoError(t, err)
 	require.Empty(t, errs)
 	require.Len(t, writer.addOptions, 1)

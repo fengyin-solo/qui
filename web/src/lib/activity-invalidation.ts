@@ -22,6 +22,8 @@ export function activityQueryKeys(event: ActivityEvent): QueryKey[] {
   switch (event.kind) {
     case "backup.run":
       return id ? [["instance-backups", id]] : [["instance-backups"]]
+    case "restore.run":
+      return id ? [["instance-restore-runs", id]] : [["instance-restore-runs"]]
     case "dirscan.run":
       return event.resourceId ? [["dir-scan", "directory", Number(event.resourceId)]] : [["dir-scan"]]
     case "orphanscan.run":
@@ -70,6 +72,7 @@ export function invalidateForActivity(queryClient: QueryClient, event: ActivityE
  */
 export const ACTIVITY_FEATURE_PREFIXES: QueryKey[] = [
   ["instance-backups"],
+  ["instance-restore-runs"],
   ["dir-scan"],
   ["orphan-scan"],
   ["disc-scans"],

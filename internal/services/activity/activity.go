@@ -26,6 +26,7 @@ type Kind string
 
 const (
 	KindBackupRun          Kind = "backup.run"
+	KindRestoreRun         Kind = "restore.run"
 	KindDirScanRun         Kind = "dirscan.run"
 	KindOrphanScanRun      Kind = "orphanscan.run"
 	KindDiscScanRun        Kind = "discscan.run"

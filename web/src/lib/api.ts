@@ -92,9 +92,12 @@ import type {
   RefreshRSSItemRequest,
   RegexValidationResult,
   RemoveRSSItemRequest,
+  RestoreEnqueueResponse,
   RestoreMode,
+  RestoreOpsResponse,
   RestorePlan,
-  RestoreResult,
+  RestoreRun,
+  RestoreRunsResponse,
   RSSItems,
   RSSMatchingArticles,
   RSSRules,
@@ -786,7 +789,7 @@ class ApiClient {
     })
   }
 
-  async executeRestore(
+  async enqueueRestore(
     instanceId: number,
     runId: number,
     payload: {
@@ -797,10 +800,41 @@ class ApiClient {
       skipHashCheck?: boolean
       autoResumeVerified?: boolean
     }
-  ): Promise<RestoreResult> {
-    return this.request<RestoreResult>(`/instances/${instanceId}/backups/runs/${runId}/restore`, {
+  ): Promise<RestoreEnqueueResponse> {
+    return this.request<RestoreEnqueueResponse>(`/instances/${instanceId}/backups/runs/${runId}/restore`, {
       method: "POST",
       body: JSON.stringify(payload),
+    })
+  }
+
+  async listRestoreRuns(
+    instanceId: number,
+    params: { limit?: number; offset?: number } = {}
+  ): Promise<RestoreRunsResponse> {
+    const query = new URLSearchParams()
+    if (params.limit !== undefined) query.set("limit", String(params.limit))
+    if (params.offset !== undefined) query.set("offset", String(params.offset))
+    const suffix = query.toString() ? `?${query.toString()}` : ""
+    return this.request<RestoreRunsResponse>(`/instances/${instanceId}/backups/restore/runs${suffix}`)
+  }
+
+  async getRestoreRun(instanceId: number, restoreRunId: number): Promise<RestoreRun> {
+    return this.request<RestoreRun>(`/instances/${instanceId}/backups/restore/runs/${restoreRunId}`)
+  }
+
+  async listRestoreOps(instanceId: number, restoreRunId: number): Promise<RestoreOpsResponse> {
+    return this.request<RestoreOpsResponse>(`/instances/${instanceId}/backups/restore/runs/${restoreRunId}/ops`)
+  }
+
+  async cancelRestoreRun(instanceId: number, restoreRunId: number): Promise<RestoreRun> {
+    return this.request<RestoreRun>(`/instances/${instanceId}/backups/restore/runs/${restoreRunId}/cancel`, {
+      method: "POST",
+    })
+  }
+
+  async resumeRestoreRun(instanceId: number, restoreRunId: number): Promise<RestoreRun> {
+    return this.request<RestoreRun>(`/instances/${instanceId}/backups/restore/runs/${restoreRunId}/resume`, {
+      method: "POST",
     })
   }
 
